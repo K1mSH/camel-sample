@@ -2,39 +2,43 @@ package com.gims.module.dbsync.service;
 
 import com.gims.module.dbsync.client.ManagerApiClient;
 import com.gims.module.dbsync.dto.MappingConfigDto;
-import com.gims.module.dbsync.entity.source.SourceData;
-import com.gims.module.dbsync.entity.target.TargetData;
-import com.gims.module.dbsync.repository.source.SourceDataRepository;
-import com.gims.module.dbsync.repository.target.TargetDataRepository;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
+import javax.sql.DataSource;
+import java.sql.*;
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * DB 동기화 서비스
+ * DB 동기화 서비스 (동적 SQL 기반)
  *
  * Source DB에서 Target DB로 데이터를 동기화하며
- * 각 단계별로 관리 시스템에 진행 상황을 보고합니다
+ * 매핑 설정에 따라 동적으로 SQL을 생성하여 실행합니다.
+ *
+ * PK 매핑은 TableMapping의 pkColumn/targetPkColumn을 사용하여 자동 처리됩니다.
  */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class DbSyncService {
 
     private final ManagerApiClient managerApiClient;
-    private final SourceDataRepository sourceDataRepository;
-    private final TargetDataRepository targetDataRepository;
+    private final DataSource sourceDataSource;
+    private final DataSource targetDataSource;
 
-    // 현재 동기화에 사용할 매핑 설정
+    public DbSyncService(
+            ManagerApiClient managerApiClient,
+            @Qualifier("sourceDataSource") DataSource sourceDataSource,
+            @Qualifier("targetDataSource") DataSource targetDataSource) {
+        this.managerApiClient = managerApiClient;
+        this.sourceDataSource = sourceDataSource;
+        this.targetDataSource = targetDataSource;
+    }
+
     private MappingConfigDto currentMappingConfig;
 
-    /**
-     * 매핑 설정 저장 (실행 전에 설정)
-     */
     public void setMappingConfig(MappingConfigDto mappingConfig) {
         this.currentMappingConfig = mappingConfig;
         if (mappingConfig != null) {
@@ -42,11 +46,11 @@ public class DbSyncService {
                     mappingConfig.getModuleId(),
                     mappingConfig.getTableMappings() != null ? mappingConfig.getTableMappings().size() : 0);
 
-            // 매핑 상세 로깅
             if (mappingConfig.getTableMappings() != null) {
                 for (MappingConfigDto.TableMappingDto tm : mappingConfig.getTableMappings()) {
-                    log.info("  - 테이블 매핑: {} -> {}, 컬럼 수={}",
+                    log.info("  - 테이블 매핑: {} -> {}, PK: {} -> {}, 컬럼 수={}",
                             tm.getSourceTable(), tm.getTargetTable(),
+                            tm.getPkColumn(), tm.getTargetPkColumn(),
                             tm.getColumnMappings() != null ? tm.getColumnMappings().size() : 0);
                 }
             }
@@ -56,263 +60,336 @@ public class DbSyncService {
     /**
      * DB 동기화 실행
      */
-//    @Transactional("targetTransactionManager")
-//    public void executeSync(Long execId, String configJson) {
-//        executeSync(execId, configJson, null);
-//    }
-
-    /**
-     * DB 동기화 실행 (매핑 설정 포함)
-     */
-    @Transactional("targetTransactionManager")
     public void executeSync(Long execId, String configJson, MappingConfigDto mappingConfig) {
         if (mappingConfig != null) {
             setMappingConfig(mappingConfig);
         }
         long startTime = System.currentTimeMillis();
-        long processedCount = 0;
-        long errorCount = 0;
+        long totalProcessedCount = 0;
+        long totalErrorCount = 0;
         boolean success = true;
         String errorMessage = null;
 
         try {
-            // === 1단계: 데이터 조회 ===
-            managerApiClient.reportProgress(execId, "데이터 조회", 10, 0L, null,
-                    "Source DB에서 데이터를 조회합니다", "INFO");
-
-            List<SourceData> sourceData = fetchSourceData();
-            long totalCount = sourceData.size();
-
-            managerApiClient.reportProgress(execId, "데이터 조회", 20, 0L, totalCount,
-                    String.format("총 %d건의 데이터를 조회했습니다", totalCount), "INFO");
-
-            // === 2단계: 데이터 변환 ===
-            managerApiClient.reportProgress(execId, "데이터 변환", 40, 0L, totalCount,
-                    "데이터를 Target 스키마로 변환합니다", "INFO");
-
-            List<TargetData> transformedData = transformData(sourceData);
-
-            managerApiClient.reportProgress(execId, "데이터 변환", 50, 0L, totalCount,
-                    String.format("%d건의 데이터 변환 완료", transformedData.size()), "INFO");
-
-            // === 3단계: 데이터 저장 (Insert or Update) ===
-            managerApiClient.reportProgress(execId, "데이터 저장", 60, 0L, totalCount,
-                    "Target DB에 데이터를 저장합니다", "INFO");
-
-            // 배치로 저장
-            int batchSize = 100;
-            for (int i = 0; i < transformedData.size(); i += batchSize) {
-                int endIdx = Math.min(i + batchSize, transformedData.size());
-                List<TargetData> batch = transformedData.subList(i, endIdx);
-
-                saveDataBatch(batch);
-                processedCount = endIdx;
-
-                int progress = 60 + (int) ((processedCount * 1.0 / totalCount) * 30); // 60~90%
-
-                managerApiClient.reportProgress(execId, "데이터 저장", progress,
-                        processedCount, totalCount,
-                        String.format("%d / %d 건 저장 중...", processedCount, totalCount), "INFO");
+            if (currentMappingConfig == null || currentMappingConfig.getTableMappings() == null
+                    || currentMappingConfig.getTableMappings().isEmpty()) {
+                throw new RuntimeException("테이블 매핑 설정이 없습니다.");
             }
 
-            managerApiClient.reportProgress(execId, "데이터 저장", 90, processedCount, totalCount,
-                    String.format("총 %d건의 데이터 저장 완료", processedCount), "INFO");
+            List<MappingConfigDto.TableMappingDto> tableMappings = currentMappingConfig.getTableMappings();
+            int tableCount = tableMappings.size();
 
-            // === 4단계: 마무리 ===
-            managerApiClient.reportProgress(execId, "완료", 100, processedCount, totalCount,
-                    "동기화가 성공적으로 완료되었습니다", "INFO");
+            managerApiClient.reportProgress(execId, "동기화 시작", 5, 0L, null,
+                    String.format("%d개 테이블 매핑에 대해 동기화를 시작합니다", tableCount), "INFO");
+
+            for (int i = 0; i < tableCount; i++) {
+                MappingConfigDto.TableMappingDto tableMapping = tableMappings.get(i);
+                int baseProgress = 10 + (int) ((i * 1.0 / tableCount) * 80);
+
+                try {
+                    long processedCount = syncTable(execId, tableMapping, baseProgress, (int) ((80.0 / tableCount)));
+                    totalProcessedCount += processedCount;
+
+//                    log.info("테이블 동기화 완료: {} -> {}, {}건",
+//                            tableMapping.getSourceTable(), tableMapping.getTargetTable(), processedCount);
+
+                } catch (Exception e) {
+                    log.error("테이블 동기화 중 오류: {} -> {}",
+                            tableMapping.getSourceTable(), tableMapping.getTargetTable(), e);
+                    totalErrorCount++;
+                    managerApiClient.reportProgress(execId, "테이블 오류", null, totalProcessedCount, null,
+                            String.format("테이블 %s -> %s 동기화 오류: %s",
+                                    tableMapping.getSourceTable(), tableMapping.getTargetTable(), e.getMessage()),
+                            "ERROR");
+                }
+            }
+
+            managerApiClient.reportProgress(execId, "완료", 100, totalProcessedCount, null,
+                    String.format("동기화 완료: %d개 테이블, 총 %d건 처리", tableCount, totalProcessedCount), "INFO");
 
         } catch (Exception e) {
             log.error("DB 동기화 중 오류 발생", e);
             success = false;
             errorMessage = e.getMessage();
-            errorCount++;
+            totalErrorCount++;
 
-            managerApiClient.reportProgress(execId, "오류 발생", null, processedCount, null,
+            managerApiClient.reportProgress(execId, "오류 발생", null, totalProcessedCount, null,
                     "오류: " + e.getMessage(), "ERROR");
 
         } finally {
-            // 실행 완료 보고
             long executionTimeMs = System.currentTimeMillis() - startTime;
 
             String resultMessage = success
-                    ? String.format("동기화 완료: 성공 %d건, 실패 %d건", processedCount, errorCount)
+                    ? String.format("동기화 완료: 성공 %d건, 실패 %d건", totalProcessedCount, totalErrorCount)
                     : "동기화 실패";
 
             managerApiClient.reportExecutionComplete(
                     execId,
                     success,
-                    processedCount,
-                    errorCount,
+                    totalProcessedCount,
+                    totalErrorCount,
                     resultMessage,
                     errorMessage,
                     executionTimeMs
             );
 
             log.info("DB 동기화 완료: success={}, processed={}, errors={}, time={}ms",
-                    success, processedCount, errorCount, executionTimeMs);
+                    success, totalProcessedCount, totalErrorCount, executionTimeMs);
         }
     }
 
     /**
-     * Source DB 데이터 조회
+     * 단일 테이블 동기화 (동적 SQL)
+     * PK는 TableMapping의 pkColumn/targetPkColumn에서 자동으로 가져옴
      */
-    private List<SourceData> fetchSourceData() {
-        log.info("Source DB에서 데이터 조회 중...");
-        return sourceDataRepository.findAll();
-    }
+    private long syncTable(Long execId, MappingConfigDto.TableMappingDto tableMapping,
+                           int baseProgress, int progressRange) throws SQLException {
 
-    /**
-     * 데이터 변환 (매핑 설정 적용)
-     */
-    private List<TargetData> transformData(List<SourceData> sourceDataList) {
-        log.info("데이터 변환 중...");
+        String sourceTable = tableMapping.getSourceTable();
+        String targetTable = tableMapping.getTargetTable();
+        String sourcePkColumn = tableMapping.getPkColumn();
+        String targetPkColumn = tableMapping.getTargetPkColumn();
+        List<MappingConfigDto.ColumnMappingDto> columnMappings = tableMapping.getColumnMappings();
 
-        // 매핑 설정이 있으면 매핑에 따라 변환
-        if (currentMappingConfig != null && currentMappingConfig.getTableMappings() != null) {
-            // source_data -> target_data 매핑 찾기
-            MappingConfigDto.TableMappingDto tableMapping = currentMappingConfig.getTableMappings().stream()
-                    .filter(tm -> "source_data".equalsIgnoreCase(tm.getSourceTable())
-                            && "target_data".equalsIgnoreCase(tm.getTargetTable()))
-                    .findFirst()
-                    .orElse(null);
+        // PK 컬럼 필수 검증
+        if (sourcePkColumn == null || sourcePkColumn.isEmpty()) {
+            String errorMsg = String.format("Source PK 컬럼이 설정되지 않았습니다: %s -> %s", sourceTable, targetTable);
+            log.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
+        if (targetPkColumn == null || targetPkColumn.isEmpty()) {
+            String errorMsg = String.format("Target PK 컬럼이 설정되지 않았습니다: %s -> %s", sourceTable, targetTable);
+            log.error(errorMsg);
+            throw new RuntimeException(errorMsg);
+        }
 
-            if (tableMapping != null && tableMapping.getColumnMappings() != null) {
-                log.info("매핑 설정 적용: {} 개의 컬럼 매핑", tableMapping.getColumnMappings().size());
-                return transformDataWithMapping(sourceDataList, tableMapping);
+        // 기간 필터링 정보
+        String sourceDateColumn = tableMapping.getSourceDateColumn();
+        LocalDateTime syncStartDt = currentMappingConfig.getSyncStartDt();
+        LocalDateTime syncEndDt = currentMappingConfig.getSyncEndDt();
+        boolean useDateFilter = sourceDateColumn != null && !sourceDateColumn.isEmpty()
+                && syncStartDt != null && syncEndDt != null;
+
+        log.info("테이블 동기화 시작: {} -> {}", sourceTable, targetTable);
+        log.info("  PK 매핑 (자동): {} -> {}", sourcePkColumn, targetPkColumn);
+        if (useDateFilter) {
+            log.info("  기간 필터링: {} ({} ~ {})", sourceDateColumn, syncStartDt, syncEndDt);
+        } else {
+            log.info("  기간 필터링: 미적용 (전체 데이터)");
+        }
+
+        // 컬럼 매핑 로깅
+        if (columnMappings != null && !columnMappings.isEmpty()) {
+            log.info("  컬럼 매핑: {}개", columnMappings.size());
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                log.info("    - {} -> {}", cm.getSourceColumn(), cm.getTargetColumn());
             }
         }
 
-        // 매핑 설정이 없으면 기본 변환 (1:1 매핑)
-        log.info("기본 변환 로직 적용 (매핑 설정 없음)");
-        return sourceDataList.stream()
-                .map(source -> TargetData.builder()
-                        .targetId(source.getId())
-                        .targetName(source.getName())
-                        .targetValue1(source.getValue1())
-                        .targetValue2(source.getValue2())
-                        .targetValue3(source.getValue3())
-                        .syncDate(new Date())
-                        .build())
-                .collect(Collectors.toList());
-    }
+        String periodInfo = useDateFilter
+                ? String.format(" (기간: %s ~ %s)", syncStartDt.toLocalDate(), syncEndDt.toLocalDate())
+                : " (전체)";
+        managerApiClient.reportProgress(execId, "테이블 조회", baseProgress, 0L, null,
+                String.format("테이블 %s에서 데이터를 조회합니다%s", sourceTable, periodInfo), "INFO");
 
-    /**
-     * 매핑 설정을 적용한 데이터 변환
-     */
-    private List<TargetData> transformDataWithMapping(List<SourceData> sourceDataList,
-                                                       MappingConfigDto.TableMappingDto tableMapping) {
-        List<MappingConfigDto.ColumnMappingDto> columnMappings = tableMapping.getColumnMappings();
+        // Source 컬럼 목록 (PK 포함)
+        List<String> sourceColumns = new ArrayList<>();
+        sourceColumns.add(sourcePkColumn);  // PK는 항상 첫 번째
+        if (columnMappings != null) {
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)) {
+                    sourceColumns.add(cm.getSourceColumn());
+                }
+            }
+        }
 
-        return sourceDataList.stream()
-                .map(source -> {
-                    TargetData.TargetDataBuilder builder = TargetData.builder();
+        // Target 컬럼 목록 (PK 포함)
+        List<String> targetColumns = new ArrayList<>();
+        targetColumns.add(targetPkColumn);  // PK는 항상 첫 번째
+        if (columnMappings != null) {
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                if (!cm.getTargetColumn().equalsIgnoreCase(targetPkColumn)) {
+                    targetColumns.add(cm.getTargetColumn());
+                }
+            }
+        }
 
-                    // targetId는 항상 source의 id로 설정 (update를 위한 키)
-                    builder.targetId(source.getId());
-                    // targetName도 기본으로 source의 name 설정
-                    builder.targetName(source.getName());
+        // Source -> Target 컬럼 매핑 맵 생성 (PK 포함)
+        Map<String, String> columnMap = new LinkedHashMap<>();
+        columnMap.put(sourcePkColumn, targetPkColumn);  // PK 매핑 추가
+        if (columnMappings != null) {
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)) {
+                    columnMap.put(cm.getSourceColumn(), cm.getTargetColumn());
+                }
+            }
+        }
 
-                    // value 컬럼들은 매핑 설정에 따라 적용
-                    for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
-                        String srcCol = cm.getSourceColumn().toLowerCase();
-                        String tgtCol = cm.getTargetColumn().toLowerCase();
+        // Source에서 데이터 조회 (기간 필터링 적용)
+        String selectSql = buildSelectSql(sourceTable, sourceColumns, sourceDateColumn, useDateFilter);
+        log.debug("SELECT SQL: {}", selectSql);
 
-                        // value 컬럼만 매핑 적용 (id, name은 위에서 이미 설정)
-                        if (srcCol.startsWith("value") && tgtCol.startsWith("target_value")) {
-                            Object sourceValue = getSourceValue(source, cm.getSourceColumn());
-                            setTargetValue(builder, cm.getTargetColumn(), sourceValue);
-                        }
+        List<Map<String, Object>> sourceData = new ArrayList<>();
+        try (Connection sourceConn = sourceDataSource.getConnection();
+             PreparedStatement pstmt = sourceConn.prepareStatement(selectSql)) {
+
+            // 기간 필터링 파라미터 바인딩
+            if (useDateFilter) {
+                pstmt.setTimestamp(1, Timestamp.valueOf(syncStartDt));
+                pstmt.setTimestamp(2, Timestamp.valueOf(syncEndDt));
+            }
+
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    for (String col : sourceColumns) {
+                        row.put(col, rs.getObject(col));
                     }
+                    sourceData.add(row);
+                }
+            }
+        }
 
-                    // syncDate는 항상 현재 시간
-                    builder.syncDate(new Date());
+        long totalCount = sourceData.size();
+        log.info("Source 데이터 조회 완료: {} 테이블, {}건", sourceTable, totalCount);
 
-                    return builder.build();
-                })
-                .collect(Collectors.toList());
+        if (totalCount == 0) {
+            return 0;
+        }
+
+        managerApiClient.reportProgress(execId, "데이터 저장", baseProgress + (progressRange / 4), 0L, totalCount,
+                String.format("%s: %d건 조회 완료, Target에 저장 시작", sourceTable, totalCount), "INFO");
+
+        // Target에 UPSERT
+        long processedCount = 0;
+        int batchSize = 100;
+
+        try (Connection targetConn = targetDataSource.getConnection()) {
+            targetConn.setAutoCommit(false);
+
+            for (int i = 0; i < sourceData.size(); i += batchSize) {
+                int endIdx = Math.min(i + batchSize, sourceData.size());
+                List<Map<String, Object>> batch = sourceData.subList(i, endIdx);
+
+                for (Map<String, Object> row : batch) {
+                    upsertRow(targetConn, targetTable, columnMap, row, sourcePkColumn, targetPkColumn);
+                }
+
+                targetConn.commit();
+                processedCount = endIdx;
+
+                int progress = baseProgress + (int) ((processedCount * 1.0 / totalCount) * progressRange);
+//                managerApiClient.reportProgress(execId, "데이터 저장", progress, processedCount, totalCount,
+//                        String.format("%s: %d / %d 건 저장 중...", targetTable, processedCount, totalCount), "INFO");
+            }
+        }
+
+        return processedCount;
     }
 
     /**
-     * Source 객체에서 컬럼 값 가져오기
+     * SELECT SQL 생성 (기간 필터링 조건 포함)
      */
-    private Object getSourceValue(SourceData source, String columnName) {
-        switch (columnName.toLowerCase()) {
-            case "id":
-                return source.getId();
-            case "name":
-                return source.getName();
-            case "value1":
-                return source.getValue1();
-            case "value2":
-                return source.getValue2();
-            case "value3":
-                return source.getValue3();
-            default:
-                log.warn("알 수 없는 소스 컬럼: {}", columnName);
-                return null;
+    private String buildSelectSql(String tableName, List<String> columns,
+                                   String dateColumn, boolean useDateFilter) {
+        String columnList = String.join(", ", columns);
+        StringBuilder sql = new StringBuilder();
+        sql.append(String.format("SELECT %s FROM %s", columnList, tableName));
+
+        if (useDateFilter && dateColumn != null) {
+            sql.append(String.format(" WHERE %s >= ? AND %s < ?", dateColumn, dateColumn));
+        }
+
+        return sql.toString();
+    }
+
+    /**
+     * UPSERT (INSERT or UPDATE)
+     */
+    private void upsertRow(Connection conn, String targetTable,
+                           Map<String, String> columnMap,
+                           Map<String, Object> sourceRow,
+                           String sourcePkColumn, String targetPkColumn) throws SQLException {
+
+        Object pkValue = sourceRow.get(sourcePkColumn);
+
+        // 기존 데이터 존재 여부 확인
+        String checkSql = String.format("SELECT 1 FROM %s WHERE %s = ?", targetTable, targetPkColumn);
+        boolean exists = false;
+
+        try (PreparedStatement checkStmt = conn.prepareStatement(checkSql)) {
+            checkStmt.setObject(1, pkValue);
+            try (ResultSet rs = checkStmt.executeQuery()) {
+                exists = rs.next();
+            }
+        }
+
+        if (exists) {
+            updateRow(conn, targetTable, columnMap, sourceRow, sourcePkColumn, targetPkColumn);
+        } else {
+            insertRow(conn, targetTable, columnMap, sourceRow, sourcePkColumn);
         }
     }
 
     /**
-     * Target Builder에 값 설정
+     * INSERT 실행
      */
-    private void setTargetValue(TargetData.TargetDataBuilder builder, String columnName, Object value) {
-        switch (columnName.toLowerCase()) {
-            case "target_id":
-            case "targetid":
-                if (value instanceof Long) {
-                    builder.targetId((Long) value);
-                } else if (value != null) {
-                    builder.targetId(Long.valueOf(value.toString()));
-                }
-                break;
-            case "target_name":
-            case "targetname":
-                builder.targetName(value != null ? value.toString() : null);
-                break;
-            case "target_value1":
-            case "targetvalue1":
-                if (value instanceof Double) {
-                    builder.targetValue1((Double) value);
-                } else if (value != null) {
-                    builder.targetValue1(Double.valueOf(value.toString()));
-                }
-                break;
-            case "target_value2":
-            case "targetvalue2":
-                if (value instanceof Double) {
-                    builder.targetValue2((Double) value);
-                } else if (value != null) {
-                    builder.targetValue2(Double.valueOf(value.toString()));
-                }
-                break;
-            case "target_value3":
-            case "targetvalue3":
-                if (value instanceof Double) {
-                    builder.targetValue3((Double) value);
-                } else if (value != null) {
-                    builder.targetValue3(Double.valueOf(value.toString()));
-                }
-                break;
-            default:
-                log.warn("알 수 없는 타겟 컬럼: {}", columnName);
+    private void insertRow(Connection conn, String targetTable,
+                           Map<String, String> columnMap,
+                           Map<String, Object> sourceRow,
+                           String sourcePkColumn) throws SQLException {
+
+        List<String> targetColumns = new ArrayList<>(columnMap.values());
+        String columnList = String.join(", ", targetColumns);
+        String placeholders = targetColumns.stream().map(c -> "?").collect(Collectors.joining(", "));
+        String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", targetTable, columnList, placeholders);
+
+        try (PreparedStatement insertStmt = conn.prepareStatement(insertSql)) {
+            int idx = 1;
+            for (String sourceCol : columnMap.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                insertStmt.setObject(idx++, value);
+            }
+            insertStmt.executeUpdate();
         }
     }
 
     /**
-     * 값 변환 (단순 전달)
+     * UPDATE 실행
      */
-    private Object applyTransform(Object sourceValue, MappingConfigDto.ColumnMappingDto mapping) {
-        // 단순히 값을 그대로 반환
-        return sourceValue;
-    }
+    private void updateRow(Connection conn, String targetTable,
+                           Map<String, String> columnMap,
+                           Map<String, Object> sourceRow,
+                           String sourcePkColumn, String targetPkColumn) throws SQLException {
 
-    /**
-     * 데이터 배치 저장
-     */
-    private void saveDataBatch(List<TargetData> batch) {
-        log.debug("배치 저장 중: {} 건", batch.size());
-        targetDataRepository.saveAll(batch);
+        // PK를 제외한 컬럼들만 업데이트
+        Map<String, String> nonPkColumns = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : columnMap.entrySet()) {
+            if (!entry.getKey().equalsIgnoreCase(sourcePkColumn)) {
+                nonPkColumns.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        if (nonPkColumns.isEmpty()) {
+            return; // PK만 있으면 업데이트할 것이 없음
+        }
+
+        String setClause = nonPkColumns.values().stream()
+                .map(col -> col + " = ?")
+                .collect(Collectors.joining(", "));
+
+        String updateSql = String.format("UPDATE %s SET %s WHERE %s = ?",
+                targetTable, setClause, targetPkColumn);
+
+        try (PreparedStatement updateStmt = conn.prepareStatement(updateSql)) {
+            int idx = 1;
+            for (String sourceCol : nonPkColumns.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                updateStmt.setObject(idx++, value);
+            }
+            // WHERE 조건의 PK 값
+            updateStmt.setObject(idx, sourceRow.get(sourcePkColumn));
+            updateStmt.executeUpdate();
+        }
     }
 }
