@@ -27,6 +27,9 @@ public class MappingConfigDto {
     private LocalDateTime syncStartDt;  // 동기화 시작 일시
     private LocalDateTime syncEndDt;    // 동기화 종료 일시
 
+    // 기간 지정 실행 여부 (true=기간지정동기화 버튼으로 실행, false=기본실행)
+    private Boolean isManualDateRange;
+
     @Data
     @Builder
     @NoArgsConstructor

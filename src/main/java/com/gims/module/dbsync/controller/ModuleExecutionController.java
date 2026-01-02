@@ -7,11 +7,14 @@ import com.gims.module.dbsync.client.ManagerApiClient;
 import com.gims.module.dbsync.dto.ManagerCallbackDto;
 import com.gims.module.dbsync.dto.MappingConfigDto;
 import com.gims.module.dbsync.service.DbSyncService;
+import com.gims.module.dbsync.service.DynamicDataSourceFactory;
+import com.zaxxer.hikari.HikariDataSource;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import javax.sql.DataSource;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -29,6 +32,7 @@ public class ModuleExecutionController {
 
     private final ManagerApiClient managerApiClient;
     private final DbSyncService dbSyncService;
+    private final DynamicDataSourceFactory dynamicDataSourceFactory;
 
     // 비동기 실행을 위한 스레드 풀
     private final ExecutorService executorService = Executors.newFixedThreadPool(3);
@@ -39,6 +43,8 @@ public class ModuleExecutionController {
         ObjectMapper mapper = new ObjectMapper();
         mapper.registerModule(new JavaTimeModule());
         mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        // ISO-8601 형식 문자열을 LocalDateTime으로 파싱하기 위해 timestamp 비활성화
+        mapper.configure(com.fasterxml.jackson.databind.SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false);
         return mapper;
     }
 
@@ -68,9 +74,11 @@ public class ModuleExecutionController {
 
                     mappingConfig = objectMapper.convertValue(mappingConfigRaw, MappingConfigDto.class);
 
-                    log.info("매핑 설정 수신 성공: moduleId={}, 테이블 매핑 수={}",
+                    log.info("매핑 설정 수신 성공: moduleId={}, 테이블 매핑 수={}, 기간: {} ~ {}",
                             mappingConfig.getModuleId(),
-                            mappingConfig.getTableMappings() != null ? mappingConfig.getTableMappings().size() : 0);
+                            mappingConfig.getTableMappings() != null ? mappingConfig.getTableMappings().size() : 0,
+                            mappingConfig.getSyncStartDt(),
+                            mappingConfig.getSyncEndDt());
 
                     // 상세 매핑 로깅
                     if (mappingConfig.getTableMappings() != null) {
@@ -111,16 +119,57 @@ public class ModuleExecutionController {
                 }
             }
 
+            // 동적 DB 연결 정보 추출 (서브모듈인 경우)
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sourceDbConfig = (Map<String, Object>) request.get("sourceDbConfig");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> targetDbConfig = (Map<String, Object>) request.get("targetDbConfig");
+
+            boolean useDynamicDs = sourceDbConfig != null && targetDbConfig != null;
+            if (useDynamicDs) {
+                log.info("동적 DataSource 사용: sourceDbConfig={}, targetDbConfig={}",
+                        sourceDbConfig.get("connectionId"), targetDbConfig.get("connectionId"));
+            } else {
+                log.info("기본 DataSource 사용");
+            }
+
             // 비동기로 동기화 작업 실행
             Long finalExecId = execId;
             MappingConfigDto finalMappingConfig = mappingConfig;
+            Map<String, Object> finalSourceDbConfig = sourceDbConfig;
+            Map<String, Object> finalTargetDbConfig = targetDbConfig;
+
             executorService.submit(() -> {
+                HikariDataSource dynamicSourceDs = null;
+                HikariDataSource dynamicTargetDs = null;
                 try {
                     log.info("동기화 작업 시작: execId={}", finalExecId);
-                    dbSyncService.executeSync(finalExecId, configJson, finalMappingConfig);
+
+                    if (finalSourceDbConfig != null && finalTargetDbConfig != null) {
+                        // 동적 DataSource 생성
+                        dynamicSourceDs = dynamicDataSourceFactory.createDataSource(finalSourceDbConfig);
+                        dynamicTargetDs = dynamicDataSourceFactory.createDataSource(finalTargetDbConfig);
+                        log.info("동적 DataSource 생성 완료");
+
+                        // 동적 DataSource로 동기화 실행
+                        dbSyncService.executeSync(finalExecId, configJson, finalMappingConfig,
+                                dynamicSourceDs, dynamicTargetDs);
+                    } else {
+                        // 기본 DataSource로 동기화 실행
+                        dbSyncService.executeSync(finalExecId, configJson, finalMappingConfig);
+                    }
                 } catch (Exception e) {
                     log.error("동기화 작업 중 예외 발생", e);
                 } finally {
+                    // 동적 DataSource 종료
+                    if (dynamicSourceDs != null && !dynamicSourceDs.isClosed()) {
+                        dynamicSourceDs.close();
+                        log.info("동적 Source DataSource 종료");
+                    }
+                    if (dynamicTargetDs != null && !dynamicTargetDs.isClosed()) {
+                        dynamicTargetDs.close();
+                        log.info("동적 Target DataSource 종료");
+                    }
                     // 동적 URL 초기화
                     managerApiClient.clearDynamicCallbackUrl();
                 }

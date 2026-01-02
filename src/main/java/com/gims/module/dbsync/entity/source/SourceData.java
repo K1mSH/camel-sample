@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import javax.persistence.*;
+import java.time.LocalDateTime;
 
 /**
  * Source DB 데이터 Entity
@@ -33,4 +34,7 @@ public class SourceData {
 
     @Column(name = "value3")
     private Double value3;
+
+    @Column(name = "created_at")
+    private LocalDateTime createdAt;
 }

@@ -50,7 +50,7 @@ public class TargetDataSourceConfig {
 
         return builder
                 .dataSource(dataSource)
-                .packages("com.gims.module.dbsync.entity.target")
+                .packages("com.gims.module.dbsync.entity.target", "com.gims.module.dbsync.entity.copy")
                 .persistenceUnit("target")
                 .properties(properties)
                 .build();

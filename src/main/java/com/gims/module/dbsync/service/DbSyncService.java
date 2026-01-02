@@ -13,12 +13,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * DB 동기화 서비스 (동적 SQL 기반)
+ * DB 동기화 서비스 (동적 SQL 기반) - 2단계 동기화
  *
- * Source DB에서 Target DB로 데이터를 동기화하며
- * 매핑 설정에 따라 동적으로 SQL을 생성하여 실행합니다.
+ * 동기화 흐름:
+ * 1단계: Source DB → Copy 테이블 (Target DB 내, Source와 동일 구조)
+ * 2단계: Copy 테이블 → Target 테이블 (매핑 적용)
  *
- * PK 매핑은 TableMapping의 pkColumn/targetPkColumn을 사용하여 자동 처리됩니다.
+ * Copy 테이블: "copy_" + sourceTable (예: copy_source_data)
+ * Target DB에 생성되며, Source 테이블과 동일한 컬럼 구조 + copy_at 컬럼
  */
 @Slf4j
 @Service
@@ -46,11 +48,15 @@ public class DbSyncService {
                     mappingConfig.getModuleId(),
                     mappingConfig.getTableMappings() != null ? mappingConfig.getTableMappings().size() : 0);
 
+            // 동기화 기간 정보 로깅
+            log.info("  동기화 기간: {} ~ {}", mappingConfig.getSyncStartDt(), mappingConfig.getSyncEndDt());
+
             if (mappingConfig.getTableMappings() != null) {
                 for (MappingConfigDto.TableMappingDto tm : mappingConfig.getTableMappings()) {
-                    log.info("  - 테이블 매핑: {} -> {}, PK: {} -> {}, 컬럼 수={}",
+                    log.info("  - 테이블 매핑: {} -> {}, PK: {} -> {}, 날짜컬럼: {}, 컬럼 수={}",
                             tm.getSourceTable(), tm.getTargetTable(),
                             tm.getPkColumn(), tm.getTargetPkColumn(),
+                            tm.getSourceDateColumn(),
                             tm.getColumnMappings() != null ? tm.getColumnMappings().size() : 0);
                 }
             }
@@ -58,9 +64,18 @@ public class DbSyncService {
     }
 
     /**
-     * DB 동기화 실행
+     * DB 동기화 실행 (기본 DataSource 사용)
      */
     public void executeSync(Long execId, String configJson, MappingConfigDto mappingConfig) {
+        executeSync(execId, configJson, mappingConfig, sourceDataSource, targetDataSource);
+    }
+
+    /**
+     * DB 동기화 실행 (동적 DataSource 사용)
+     * 관리 시스템에서 전달받은 DB 연결 정보로 생성된 DataSource 사용
+     */
+    public void executeSync(Long execId, String configJson, MappingConfigDto mappingConfig,
+                            DataSource dynamicSourceDs, DataSource dynamicTargetDs) {
         if (mappingConfig != null) {
             setMappingConfig(mappingConfig);
         }
@@ -87,7 +102,8 @@ public class DbSyncService {
                 int baseProgress = 10 + (int) ((i * 1.0 / tableCount) * 80);
 
                 try {
-                    long processedCount = syncTable(execId, tableMapping, baseProgress, (int) ((80.0 / tableCount)));
+                    long processedCount = syncTable(execId, tableMapping, baseProgress, (int) ((80.0 / tableCount)),
+                            dynamicSourceDs, dynamicTargetDs);
                     totalProcessedCount += processedCount;
 
 //                    log.info("테이블 동기화 완료: {} -> {}, {}건",
@@ -139,17 +155,22 @@ public class DbSyncService {
     }
 
     /**
-     * 단일 테이블 동기화 (동적 SQL)
-     * PK는 TableMapping의 pkColumn/targetPkColumn에서 자동으로 가져옴
+     * 단일 테이블 동기화 (2단계)
+     * 1단계: Source → Copy 테이블 (동일 구조 복사)
+     * 2단계: Copy → Target 테이블 (매핑 적용)
      */
     private long syncTable(Long execId, MappingConfigDto.TableMappingDto tableMapping,
-                           int baseProgress, int progressRange) throws SQLException {
+                           int baseProgress, int progressRange,
+                           DataSource srcDataSource, DataSource tgtDataSource) throws SQLException {
 
         String sourceTable = tableMapping.getSourceTable();
         String targetTable = tableMapping.getTargetTable();
         String sourcePkColumn = tableMapping.getPkColumn();
         String targetPkColumn = tableMapping.getTargetPkColumn();
         List<MappingConfigDto.ColumnMappingDto> columnMappings = tableMapping.getColumnMappings();
+
+        // Copy 테이블 이름 생성: "copy_" + sourceTable
+        String copyTable = "copy_" + sourceTable;
 
         // PK 컬럼 필수 검증
         if (sourcePkColumn == null || sourcePkColumn.isEmpty()) {
@@ -167,73 +188,90 @@ public class DbSyncService {
         String sourceDateColumn = tableMapping.getSourceDateColumn();
         LocalDateTime syncStartDt = currentMappingConfig.getSyncStartDt();
         LocalDateTime syncEndDt = currentMappingConfig.getSyncEndDt();
+
+        // sourceDateColumn이 설정되어 있지 않으면 자동 감지 시도
+        if ((sourceDateColumn == null || sourceDateColumn.isEmpty()) && syncStartDt != null && syncEndDt != null) {
+            sourceDateColumn = detectSourceDateColumn(srcDataSource, sourceTable);
+            if (sourceDateColumn != null) {
+                log.info("Source 날짜 컬럼 자동 감지됨: {}", sourceDateColumn);
+            }
+        }
+
         boolean useDateFilter = sourceDateColumn != null && !sourceDateColumn.isEmpty()
                 && syncStartDt != null && syncEndDt != null;
 
-        log.info("테이블 동기화 시작: {} -> {}", sourceTable, targetTable);
-        log.info("  PK 매핑 (자동): {} -> {}", sourcePkColumn, targetPkColumn);
+        // 기간 지정 동기화 실행 여부 (is_updated 값 결정용)
+        boolean isManualDateRange = currentMappingConfig.getIsManualDateRange() != null
+                && currentMappingConfig.getIsManualDateRange();
+
+        log.info("========================================");
+        log.info("테이블 동기화 시작 (2단계 구조)");
+        log.info("  Source: {} -> Copy: {} -> Target: {}", sourceTable, copyTable, targetTable);
+        log.info("  PK: {} -> {}", sourcePkColumn, targetPkColumn);
+        log.info("  동기화 기간: {} ~ {}", syncStartDt, syncEndDt);
+        log.info("  기간지정실행: {} (is_updated = {})", isManualDateRange, isManualDateRange);
         if (useDateFilter) {
-            log.info("  기간 필터링: {} ({} ~ {})", sourceDateColumn, syncStartDt, syncEndDt);
-        } else {
-            log.info("  기간 필터링: 미적용 (전체 데이터)");
+            log.info("  기간 필터링: {} 컬럼 기준", sourceDateColumn);
+        }
+        log.info("========================================");
+
+        // ========== 1단계: Source → Copy ==========
+        log.info("[1단계] Source → Copy 시작");
+        managerApiClient.reportProgress(execId, "1단계: Source→Copy", baseProgress, 0L, null,
+                String.format("Source %s 에서 Copy %s 로 데이터를 복사합니다", sourceTable, copyTable), "INFO");
+
+        long copyCount = syncSourceToCopy(execId, srcDataSource, tgtDataSource,
+                sourceTable, copyTable, sourcePkColumn, sourceDateColumn,
+                syncStartDt, syncEndDt, useDateFilter, isManualDateRange);
+
+        if (copyCount == 0) {
+            log.info("[1단계] 복사할 데이터가 없습니다.");
+            return 0;
+        }
+        log.info("[1단계] Source → Copy 완료: {}건", copyCount);
+
+        // ========== 2단계: Copy → Target ==========
+        log.info("[2단계] Copy → Target 시작");
+        managerApiClient.reportProgress(execId, "2단계: Copy→Target",
+                baseProgress + (progressRange / 2), copyCount, null,
+                String.format("Copy %s 에서 Target %s 로 매핑 적용하여 저장합니다", copyTable, targetTable), "INFO");
+
+        long targetCount = syncCopyToTarget(execId, tgtDataSource,
+                copyTable, targetTable, sourcePkColumn, targetPkColumn,
+                columnMappings, sourceDateColumn, isManualDateRange);
+
+        log.info("[2단계] Copy → Target 완료: {}건", targetCount);
+
+        return targetCount;
+    }
+
+    /**
+     * 1단계: Source → Copy (동일 구조 복사)
+     * Source 테이블의 모든 컬럼을 그대로 Copy 테이블에 복사
+     * source_uk 생성: {sourceTable}_{sourcePK}
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (is_updated 값 결정용)
+     */
+    private long syncSourceToCopy(Long execId, DataSource srcDataSource, DataSource tgtDataSource,
+                                   String sourceTable, String copyTable, String sourcePkColumn,
+                                   String sourceDateColumn, LocalDateTime syncStartDt, LocalDateTime syncEndDt,
+                                   boolean useDateFilter, boolean isManualDateRange) throws SQLException {
+
+        // Source 테이블의 모든 컬럼 조회
+        List<String> sourceColumns = getAllColumns(srcDataSource, sourceTable);
+        if (sourceColumns.isEmpty()) {
+            throw new RuntimeException("Source 테이블 컬럼을 조회할 수 없습니다: " + sourceTable);
         }
 
-        // 컬럼 매핑 로깅
-        if (columnMappings != null && !columnMappings.isEmpty()) {
-            log.info("  컬럼 매핑: {}개", columnMappings.size());
-            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
-                log.info("    - {} -> {}", cm.getSourceColumn(), cm.getTargetColumn());
-            }
-        }
-
-        String periodInfo = useDateFilter
-                ? String.format(" (기간: %s ~ %s)", syncStartDt.toLocalDate(), syncEndDt.toLocalDate())
-                : " (전체)";
-        managerApiClient.reportProgress(execId, "테이블 조회", baseProgress, 0L, null,
-                String.format("테이블 %s에서 데이터를 조회합니다%s", sourceTable, periodInfo), "INFO");
-
-        // Source 컬럼 목록 (PK 포함)
-        List<String> sourceColumns = new ArrayList<>();
-        sourceColumns.add(sourcePkColumn);  // PK는 항상 첫 번째
-        if (columnMappings != null) {
-            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
-                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)) {
-                    sourceColumns.add(cm.getSourceColumn());
-                }
-            }
-        }
-
-        // Target 컬럼 목록 (PK 포함)
-        List<String> targetColumns = new ArrayList<>();
-        targetColumns.add(targetPkColumn);  // PK는 항상 첫 번째
-        if (columnMappings != null) {
-            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
-                if (!cm.getTargetColumn().equalsIgnoreCase(targetPkColumn)) {
-                    targetColumns.add(cm.getTargetColumn());
-                }
-            }
-        }
-
-        // Source -> Target 컬럼 매핑 맵 생성 (PK 포함)
-        Map<String, String> columnMap = new LinkedHashMap<>();
-        columnMap.put(sourcePkColumn, targetPkColumn);  // PK 매핑 추가
-        if (columnMappings != null) {
-            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
-                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)) {
-                    columnMap.put(cm.getSourceColumn(), cm.getTargetColumn());
-                }
-            }
-        }
+        log.info("  Source 컬럼: {}", sourceColumns);
 
         // Source에서 데이터 조회 (기간 필터링 적용)
         String selectSql = buildSelectSql(sourceTable, sourceColumns, sourceDateColumn, useDateFilter);
-        log.debug("SELECT SQL: {}", selectSql);
+        log.debug("  SELECT SQL: {}", selectSql);
 
         List<Map<String, Object>> sourceData = new ArrayList<>();
-        try (Connection sourceConn = sourceDataSource.getConnection();
+        try (Connection sourceConn = srcDataSource.getConnection();
              PreparedStatement pstmt = sourceConn.prepareStatement(selectSql)) {
 
-            // 기간 필터링 파라미터 바인딩
             if (useDateFilter) {
                 pstmt.setTimestamp(1, Timestamp.valueOf(syncStartDt));
                 pstmt.setTimestamp(2, Timestamp.valueOf(syncEndDt));
@@ -245,26 +283,32 @@ public class DbSyncService {
                     for (String col : sourceColumns) {
                         row.put(col, rs.getObject(col));
                     }
+                    // source_uk 생성: {sourceTable}_{sourcePK}
+                    Object pkValue = row.get(sourcePkColumn);
+                    String sourceUk = sourceTable + "_" + pkValue;
+                    row.put("source_uk", sourceUk);
                     sourceData.add(row);
                 }
             }
         }
 
-        long totalCount = sourceData.size();
-        log.info("Source 데이터 조회 완료: {} 테이블, {}건", sourceTable, totalCount);
+        log.info("  Source 데이터 조회 완료: {}건 (source_uk 생성됨)", sourceData.size());
 
-        if (totalCount == 0) {
+        if (sourceData.isEmpty()) {
             return 0;
         }
 
-        managerApiClient.reportProgress(execId, "데이터 저장", baseProgress + (progressRange / 4), 0L, totalCount,
-                String.format("%s: %d건 조회 완료, Target에 저장 시작", sourceTable, totalCount), "INFO");
+        // Copy 테이블에 UPSERT (동일 구조이므로 컬럼명 그대로 사용 + source_uk 추가)
+        Map<String, String> copyColumnMap = new LinkedHashMap<>();
+        copyColumnMap.put("source_uk", "source_uk");  // source_uk 먼저 추가
+        for (String col : sourceColumns) {
+            copyColumnMap.put(col, col);  // Source 컬럼 = Copy 컬럼 (동일)
+        }
 
-        // Target에 UPSERT
         long processedCount = 0;
         int batchSize = 100;
 
-        try (Connection targetConn = targetDataSource.getConnection()) {
+        try (Connection targetConn = tgtDataSource.getConnection()) {
             targetConn.setAutoCommit(false);
 
             for (int i = 0; i < sourceData.size(); i += batchSize) {
@@ -272,19 +316,430 @@ public class DbSyncService {
                 List<Map<String, Object>> batch = sourceData.subList(i, endIdx);
 
                 for (Map<String, Object> row : batch) {
-                    upsertRow(targetConn, targetTable, columnMap, row, sourcePkColumn, targetPkColumn);
+                    upsertRowToCopy(targetConn, copyTable, copyColumnMap, row, isManualDateRange);
                 }
 
                 targetConn.commit();
                 processedCount = endIdx;
-
-                int progress = baseProgress + (int) ((processedCount * 1.0 / totalCount) * progressRange);
-//                managerApiClient.reportProgress(execId, "데이터 저장", progress, processedCount, totalCount,
-//                        String.format("%s: %d / %d 건 저장 중...", targetTable, processedCount, totalCount), "INFO");
             }
         }
 
         return processedCount;
+    }
+
+    /**
+     * 2단계: Copy → Target (매핑 적용)
+     * Copy 테이블에서 데이터를 읽어 Target 테이블에 매핑하여 저장
+     * source_uk를 사용하여 UPSERT
+     */
+    /**
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (is_updated 값 결정용)
+     */
+    private long syncCopyToTarget(Long execId, DataSource tgtDataSource,
+                                   String copyTable, String targetTable,
+                                   String sourcePkColumn, String targetPkColumn,
+                                   List<MappingConfigDto.ColumnMappingDto> columnMappings,
+                                   String sourceDateColumn, boolean isManualDateRange) throws SQLException {
+
+        // Copy 테이블에서 컬럼 목록 구성 (source_uk 필수 포함)
+        List<String> copyColumns = new ArrayList<>();
+        copyColumns.add("source_uk");  // source_uk 필수
+        copyColumns.add(sourcePkColumn);
+        if (columnMappings != null) {
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)
+                        && !cm.getSourceColumn().equalsIgnoreCase("source_uk")
+                        && !copyColumns.contains(cm.getSourceColumn())) {
+                    copyColumns.add(cm.getSourceColumn());
+                }
+            }
+        }
+
+        // Copy → Target 컬럼 매핑 맵 생성 (source_uk는 그대로)
+        Map<String, String> columnMap = new LinkedHashMap<>();
+        columnMap.put("source_uk", "source_uk");  // source_uk는 그대로 매핑
+        // PK는 매핑에서 제외 (Target에 source의 PK 컬럼은 저장 안 함)
+        if (columnMappings != null) {
+            for (MappingConfigDto.ColumnMappingDto cm : columnMappings) {
+                if (!cm.getSourceColumn().equalsIgnoreCase(sourcePkColumn)
+                        && !cm.getSourceColumn().equalsIgnoreCase("source_uk")) {
+                    columnMap.put(cm.getSourceColumn(), cm.getTargetColumn());
+                }
+            }
+        }
+
+        // 날짜 컬럼 자동 매핑 (created_at -> source_created_at 등)
+        if (sourceDateColumn != null && !sourceDateColumn.isEmpty()
+                && !columnMap.containsKey(sourceDateColumn)) {
+            String targetDateColumn = detectTargetDateColumn(tgtDataSource, targetTable, sourceDateColumn);
+            if (targetDateColumn != null) {
+                if (!copyColumns.contains(sourceDateColumn)) {
+                    copyColumns.add(sourceDateColumn);
+                }
+                columnMap.put(sourceDateColumn, targetDateColumn);
+                log.info("  날짜 컬럼 자동 매핑: {} -> {}", sourceDateColumn, targetDateColumn);
+            }
+        }
+
+        // 모든 날짜 컬럼 자동 매핑
+        Map<String, String> autoDateMappings = detectAllDateColumnMappings(
+                tgtDataSource, tgtDataSource, copyTable, targetTable, new ArrayList<>(columnMap.keySet()));
+        for (Map.Entry<String, String> entry : autoDateMappings.entrySet()) {
+            if (!columnMap.containsKey(entry.getKey())) {
+                if (!copyColumns.contains(entry.getKey())) {
+                    copyColumns.add(entry.getKey());
+                }
+                columnMap.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        log.info("  Copy → Target 컬럼 매핑:");
+        for (Map.Entry<String, String> entry : columnMap.entrySet()) {
+            log.info("    {} -> {}", entry.getKey(), entry.getValue());
+        }
+
+        // Copy 테이블에서 데이터 조회 (전체 - 이미 1단계에서 필터링됨)
+        String selectSql = "SELECT " + String.join(", ", copyColumns) + " FROM " + copyTable;
+        log.debug("  SELECT SQL: {}", selectSql);
+
+        List<Map<String, Object>> copyData = new ArrayList<>();
+        try (Connection conn = tgtDataSource.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(selectSql);
+             ResultSet rs = pstmt.executeQuery()) {
+
+            while (rs.next()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                for (String col : copyColumns) {
+                    row.put(col, rs.getObject(col));
+                }
+                copyData.add(row);
+            }
+        }
+
+        log.info("  Copy 테이블 데이터 조회 완료: {}건", copyData.size());
+
+        if (copyData.isEmpty()) {
+            return 0;
+        }
+
+        // Target 테이블에 UPSERT (source_uk 기준)
+        long processedCount = 0;
+        int batchSize = 100;
+
+        try (Connection targetConn = tgtDataSource.getConnection()) {
+            targetConn.setAutoCommit(false);
+
+            for (int i = 0; i < copyData.size(); i += batchSize) {
+                int endIdx = Math.min(i + batchSize, copyData.size());
+                List<Map<String, Object>> batch = copyData.subList(i, endIdx);
+
+                for (Map<String, Object> row : batch) {
+                    upsertRowToTarget(targetConn, targetTable, columnMap, row, isManualDateRange);
+                }
+
+                targetConn.commit();
+                processedCount = endIdx;
+            }
+        }
+
+        return processedCount;
+    }
+
+    /**
+     * Copy 테이블에 UPSERT (source_uk 기준, copy_at 컬럼 자동 설정)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void upsertRowToCopy(Connection conn, String copyTable,
+                                  Map<String, String> columnMap,
+                                  Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        String sourceUk = (String) sourceRow.get("source_uk");
+
+        // source_uk로 기존 데이터 존재 여부 확인
+        String checkSql = String.format("SELECT 1 FROM %s WHERE source_uk = ?", copyTable);
+        boolean exists = false;
+
+        try (PreparedStatement checkStmt = conn.prepareStatement(checkSql)) {
+            checkStmt.setString(1, sourceUk);
+            try (ResultSet rs = checkStmt.executeQuery()) {
+                exists = rs.next();
+            }
+        }
+
+        if (exists) {
+            updateRowInCopy(conn, copyTable, columnMap, sourceRow, isManualDateRange);
+        } else {
+            insertRowToCopy(conn, copyTable, columnMap, sourceRow, isManualDateRange);
+        }
+    }
+
+    /**
+     * Copy 테이블에 INSERT (copy_at, is_updated 컬럼 자동 추가)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void insertRowToCopy(Connection conn, String copyTable,
+                                  Map<String, String> columnMap,
+                                  Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        List<String> columns = new ArrayList<>(columnMap.values());
+
+        // copy_at 컬럼 추가 (있으면)
+        String copyAtColumn = detectCopyAtColumn(conn, copyTable, columns);
+        boolean hasCopyAt = copyAtColumn != null;
+        if (hasCopyAt) {
+            columns.add(copyAtColumn);
+        }
+
+        // is_updated 컬럼 추가
+        columns.add("is_updated");
+
+        String columnList = String.join(", ", columns);
+        String placeholders = columns.stream().map(c -> "?").collect(Collectors.joining(", "));
+        String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", copyTable, columnList, placeholders);
+
+        try (PreparedStatement insertStmt = conn.prepareStatement(insertSql)) {
+            int idx = 1;
+            for (String sourceCol : columnMap.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                insertStmt.setObject(idx++, value);
+            }
+            if (hasCopyAt) {
+                insertStmt.setTimestamp(idx++, Timestamp.valueOf(LocalDateTime.now()));
+            }
+            // is_updated: 기간지정=true, 기본실행=false
+            insertStmt.setBoolean(idx, isManualDateRange);
+            insertStmt.executeUpdate();
+        }
+    }
+
+    /**
+     * Copy 테이블 UPDATE (source_uk 기준, copy_at, is_updated 컬럼 자동 업데이트)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void updateRowInCopy(Connection conn, String copyTable,
+                                  Map<String, String> columnMap,
+                                  Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        // source_uk를 제외한 컬럼들만 업데이트
+        Map<String, String> nonUkColumns = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : columnMap.entrySet()) {
+            if (!entry.getKey().equalsIgnoreCase("source_uk")) {
+                nonUkColumns.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        List<String> existingCols = new ArrayList<>(nonUkColumns.values());
+        existingCols.add("source_uk");
+        String copyAtColumn = detectCopyAtColumn(conn, copyTable, existingCols);
+        boolean hasCopyAt = copyAtColumn != null;
+
+        StringBuilder setClauseBuilder = new StringBuilder();
+        if (!nonUkColumns.isEmpty()) {
+            setClauseBuilder.append(nonUkColumns.values().stream()
+                    .map(col -> col + " = ?")
+                    .collect(Collectors.joining(", ")));
+        }
+        if (hasCopyAt) {
+            if (setClauseBuilder.length() > 0) {
+                setClauseBuilder.append(", ");
+            }
+            setClauseBuilder.append(copyAtColumn).append(" = ?");
+        }
+        // is_updated 컬럼 추가
+        if (setClauseBuilder.length() > 0) {
+            setClauseBuilder.append(", ");
+        }
+        setClauseBuilder.append("is_updated = ?");
+
+        String updateSql = String.format("UPDATE %s SET %s WHERE source_uk = ?",
+                copyTable, setClauseBuilder.toString());
+
+        try (PreparedStatement updateStmt = conn.prepareStatement(updateSql)) {
+            int idx = 1;
+            for (String sourceCol : nonUkColumns.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                updateStmt.setObject(idx++, value);
+            }
+            if (hasCopyAt) {
+                updateStmt.setTimestamp(idx++, Timestamp.valueOf(LocalDateTime.now()));
+            }
+            // is_updated: 기간지정=true, 기본실행=false
+            updateStmt.setBoolean(idx++, isManualDateRange);
+            updateStmt.setString(idx, (String) sourceRow.get("source_uk"));
+            updateStmt.executeUpdate();
+        }
+    }
+
+    /**
+     * Target 테이블에 UPSERT (source_uk 기준)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void upsertRowToTarget(Connection conn, String targetTable,
+                                    Map<String, String> columnMap,
+                                    Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        String sourceUk = (String) sourceRow.get("source_uk");
+
+        // source_uk로 기존 데이터 존재 여부 확인
+        String checkSql = String.format("SELECT 1 FROM %s WHERE source_uk = ?", targetTable);
+        boolean exists = false;
+
+        try (PreparedStatement checkStmt = conn.prepareStatement(checkSql)) {
+            checkStmt.setString(1, sourceUk);
+            try (ResultSet rs = checkStmt.executeQuery()) {
+                exists = rs.next();
+            }
+        }
+
+        if (exists) {
+            updateRowInTarget(conn, targetTable, columnMap, sourceRow, isManualDateRange);
+        } else {
+            insertRowToTarget(conn, targetTable, columnMap, sourceRow, isManualDateRange);
+        }
+    }
+
+    /**
+     * Target 테이블에 INSERT (sync 타임스탬프, is_updated 자동 추가)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void insertRowToTarget(Connection conn, String targetTable,
+                                    Map<String, String> columnMap,
+                                    Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        List<String> targetColumns = new ArrayList<>(columnMap.values());
+
+        // sync 타임스탬프 컬럼 자동 추가
+        String syncColumn = detectSyncTimestampColumn(conn, targetTable, targetColumns);
+        boolean hasSyncColumn = syncColumn != null;
+        if (hasSyncColumn) {
+            targetColumns.add(syncColumn);
+        }
+
+        // is_updated 컬럼 추가
+        targetColumns.add("is_updated");
+
+        String columnList = String.join(", ", targetColumns);
+        String placeholders = targetColumns.stream().map(c -> "?").collect(Collectors.joining(", "));
+        String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", targetTable, columnList, placeholders);
+
+        try (PreparedStatement insertStmt = conn.prepareStatement(insertSql)) {
+            int idx = 1;
+            for (String sourceCol : columnMap.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                insertStmt.setObject(idx++, value);
+            }
+            if (hasSyncColumn) {
+                insertStmt.setTimestamp(idx++, Timestamp.valueOf(LocalDateTime.now()));
+            }
+            // is_updated: 기간지정=true, 기본실행=false
+            insertStmt.setBoolean(idx, isManualDateRange);
+            insertStmt.executeUpdate();
+        }
+    }
+
+    /**
+     * Target 테이블 UPDATE (source_uk 기준, sync 타임스탬프, is_updated 자동 업데이트)
+     * @param isManualDateRange 기간 지정 동기화 실행 여부 (true=기간지정, false=기본실행)
+     */
+    private void updateRowInTarget(Connection conn, String targetTable,
+                                    Map<String, String> columnMap,
+                                    Map<String, Object> sourceRow, boolean isManualDateRange) throws SQLException {
+
+        // source_uk를 제외한 컬럼들만 업데이트
+        Map<String, String> nonUkColumns = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : columnMap.entrySet()) {
+            if (!entry.getKey().equalsIgnoreCase("source_uk")) {
+                nonUkColumns.put(entry.getKey(), entry.getValue());
+            }
+        }
+
+        List<String> existingTargetCols = new ArrayList<>(nonUkColumns.values());
+        existingTargetCols.add("source_uk");
+        String syncColumn = detectSyncTimestampColumn(conn, targetTable, existingTargetCols);
+        boolean hasSyncColumn = syncColumn != null;
+
+        StringBuilder setClauseBuilder = new StringBuilder();
+        if (!nonUkColumns.isEmpty()) {
+            setClauseBuilder.append(nonUkColumns.values().stream()
+                    .map(col -> col + " = ?")
+                    .collect(Collectors.joining(", ")));
+        }
+        if (hasSyncColumn) {
+            if (setClauseBuilder.length() > 0) {
+                setClauseBuilder.append(", ");
+            }
+            setClauseBuilder.append(syncColumn).append(" = ?");
+        }
+        // is_updated 컬럼 추가
+        if (setClauseBuilder.length() > 0) {
+            setClauseBuilder.append(", ");
+        }
+        setClauseBuilder.append("is_updated = ?");
+
+        String updateSql = String.format("UPDATE %s SET %s WHERE source_uk = ?",
+                targetTable, setClauseBuilder.toString());
+
+        try (PreparedStatement updateStmt = conn.prepareStatement(updateSql)) {
+            int idx = 1;
+            for (String sourceCol : nonUkColumns.keySet()) {
+                Object value = sourceRow.get(sourceCol);
+                updateStmt.setObject(idx++, value);
+            }
+            if (hasSyncColumn) {
+                updateStmt.setTimestamp(idx++, Timestamp.valueOf(LocalDateTime.now()));
+            }
+            // is_updated: 기간지정=true, 기본실행=false
+            updateStmt.setBoolean(idx++, isManualDateRange);
+            updateStmt.setString(idx, (String) sourceRow.get("source_uk"));
+            updateStmt.executeUpdate();
+        }
+    }
+
+    /**
+     * copy_at 컬럼 감지
+     */
+    private String detectCopyAtColumn(Connection conn, String table, List<String> existingColumns) {
+        String[] copyAtPatterns = {"copy_at", "copied_at", "copy_date", "copy_timestamp"};
+
+        try {
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet columns = metaData.getColumns(null, null, table, null)) {
+                while (columns.next()) {
+                    String columnName = columns.getString("COLUMN_NAME").toLowerCase();
+                    boolean alreadyMapped = existingColumns.stream()
+                            .anyMatch(c -> c.equalsIgnoreCase(columnName));
+                    if (alreadyMapped) {
+                        continue;
+                    }
+                    for (String pattern : copyAtPatterns) {
+                        if (columnName.equals(pattern)) {
+                            return columnName;
+                        }
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            log.debug("copy_at 컬럼 감지 실패 (무시): {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 테이블의 모든 컬럼 목록 조회
+     */
+    private List<String> getAllColumns(DataSource dataSource, String tableName) {
+        List<String> columns = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet rs = metaData.getColumns(null, null, tableName, null)) {
+                while (rs.next()) {
+                    columns.add(rs.getString("COLUMN_NAME").toLowerCase());
+                }
+            }
+        } catch (SQLException e) {
+            log.error("테이블 컬럼 조회 실패: {}", tableName, e);
+        }
+        return columns;
     }
 
     /**
@@ -304,92 +759,148 @@ public class DbSyncService {
     }
 
     /**
-     * UPSERT (INSERT or UPDATE)
+     * Target 테이블에서 sync 타임스탬프 컬럼 감지
+     * 이미 매핑에 포함된 컬럼은 제외
      */
-    private void upsertRow(Connection conn, String targetTable,
-                           Map<String, String> columnMap,
-                           Map<String, Object> sourceRow,
-                           String sourcePkColumn, String targetPkColumn) throws SQLException {
+    private String detectSyncTimestampColumn(Connection conn, String targetTable, List<String> existingColumns) {
+        // 일반적인 sync 타임스탬프 컬럼명 패턴
+        String[] syncColumnPatterns = {"sync_date", "sync_timestamp", "sync_at", "synced_at", "last_sync"};
 
-        Object pkValue = sourceRow.get(sourcePkColumn);
-
-        // 기존 데이터 존재 여부 확인
-        String checkSql = String.format("SELECT 1 FROM %s WHERE %s = ?", targetTable, targetPkColumn);
-        boolean exists = false;
-
-        try (PreparedStatement checkStmt = conn.prepareStatement(checkSql)) {
-            checkStmt.setObject(1, pkValue);
-            try (ResultSet rs = checkStmt.executeQuery()) {
-                exists = rs.next();
+        try {
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet columns = metaData.getColumns(null, null, targetTable, null)) {
+                while (columns.next()) {
+                    String columnName = columns.getString("COLUMN_NAME").toLowerCase();
+                    // 이미 매핑에 있으면 건너뜀
+                    boolean alreadyMapped = existingColumns.stream()
+                            .anyMatch(c -> c.equalsIgnoreCase(columnName));
+                    if (alreadyMapped) {
+                        continue;
+                    }
+                    // sync 타임스탬프 컬럼인지 확인
+                    for (String pattern : syncColumnPatterns) {
+                        if (columnName.equals(pattern)) {
+//                            log.debug("Sync 타임스탬프 컬럼 감지: {} in {}", columnName, targetTable);
+                            return columnName;
+                        }
+                    }
+                }
             }
+        } catch (SQLException e) {
+            log.debug("테이블 메타데이터 조회 실패 (무시): {}", e.getMessage());
         }
-
-        if (exists) {
-            updateRow(conn, targetTable, columnMap, sourceRow, sourcePkColumn, targetPkColumn);
-        } else {
-            insertRow(conn, targetTable, columnMap, sourceRow, sourcePkColumn);
-        }
+        return null;
     }
 
     /**
-     * INSERT 실행
+     * Source 날짜 컬럼에 대응하는 Target 컬럼 감지
+     * 예: created_at -> source_created_at, updated_at -> source_updated_at
      */
-    private void insertRow(Connection conn, String targetTable,
-                           Map<String, String> columnMap,
-                           Map<String, Object> sourceRow,
-                           String sourcePkColumn) throws SQLException {
+    private String detectTargetDateColumn(DataSource targetDataSource, String targetTable, String sourceDateColumn) {
+        // 대응 패턴: source_{컬럼명}, {컬럼명}
+        String[] patterns = {
+            "source_" + sourceDateColumn,       // source_created_at
+            sourceDateColumn                     // created_at (동일 이름)
+        };
 
-        List<String> targetColumns = new ArrayList<>(columnMap.values());
-        String columnList = String.join(", ", targetColumns);
-        String placeholders = targetColumns.stream().map(c -> "?").collect(Collectors.joining(", "));
-        String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", targetTable, columnList, placeholders);
-
-        try (PreparedStatement insertStmt = conn.prepareStatement(insertSql)) {
-            int idx = 1;
-            for (String sourceCol : columnMap.keySet()) {
-                Object value = sourceRow.get(sourceCol);
-                insertStmt.setObject(idx++, value);
+        try (Connection conn = targetDataSource.getConnection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet columns = metaData.getColumns(null, null, targetTable, null)) {
+                while (columns.next()) {
+                    String columnName = columns.getString("COLUMN_NAME").toLowerCase();
+                    for (String pattern : patterns) {
+                        if (columnName.equals(pattern.toLowerCase())) {
+                            return columnName;
+                        }
+                    }
+                }
             }
-            insertStmt.executeUpdate();
+        } catch (SQLException e) {
+            log.debug("Target 날짜 컬럼 감지 실패 (무시): {}", e.getMessage());
         }
+        return null;
     }
 
     /**
-     * UPDATE 실행
+     * Source 테이블에서 날짜 컬럼 자동 감지
+     * created_at, updated_at, create_date, update_date 등
      */
-    private void updateRow(Connection conn, String targetTable,
-                           Map<String, String> columnMap,
-                           Map<String, Object> sourceRow,
-                           String sourcePkColumn, String targetPkColumn) throws SQLException {
+    private String detectSourceDateColumn(DataSource sourceDataSource, String sourceTable) {
+        // 일반적인 날짜 컬럼명 패턴 (우선순위 순)
+        String[] dateColumnPatterns = {
+            "created_at", "create_at", "created_date", "create_date", "reg_dt", "reg_date",
+            "updated_at", "update_at", "updated_date", "update_date", "upd_dt", "mod_date",
+            "insert_date", "insert_dt", "timestamp", "date_created"
+        };
 
-        // PK를 제외한 컬럼들만 업데이트
-        Map<String, String> nonPkColumns = new LinkedHashMap<>();
-        for (Map.Entry<String, String> entry : columnMap.entrySet()) {
-            if (!entry.getKey().equalsIgnoreCase(sourcePkColumn)) {
-                nonPkColumns.put(entry.getKey(), entry.getValue());
+        try (Connection conn = sourceDataSource.getConnection()) {
+            DatabaseMetaData metaData = conn.getMetaData();
+            try (ResultSet columns = metaData.getColumns(null, null, sourceTable, null)) {
+                java.util.Set<String> tableColumns = new java.util.HashSet<>();
+                while (columns.next()) {
+                    tableColumns.add(columns.getString("COLUMN_NAME").toLowerCase());
+                }
+
+                // 패턴 순서대로 매칭
+                for (String pattern : dateColumnPatterns) {
+                    if (tableColumns.contains(pattern)) {
+                        log.info("Source 날짜 컬럼 자동 감지: {} in {}", pattern, sourceTable);
+                        return pattern;
+                    }
+                }
             }
+        } catch (SQLException e) {
+            log.debug("Source 날짜 컬럼 감지 실패 (무시): {}", e.getMessage());
         }
+        return null;
+    }
 
-        if (nonPkColumns.isEmpty()) {
-            return; // PK만 있으면 업데이트할 것이 없음
-        }
+    /**
+     * Source 테이블의 모든 날짜성 컬럼 감지 (복수)
+     * Target에 대응 컬럼이 있으면 모두 자동 매핑
+     */
+    private Map<String, String> detectAllDateColumnMappings(
+            DataSource sourceDataSource, DataSource targetDataSource,
+            String sourceTable, String targetTable, List<String> existingMappedSourceCols) {
 
-        String setClause = nonPkColumns.values().stream()
-                .map(col -> col + " = ?")
-                .collect(Collectors.joining(", "));
+        Map<String, String> dateColumnMappings = new LinkedHashMap<>();
 
-        String updateSql = String.format("UPDATE %s SET %s WHERE %s = ?",
-                targetTable, setClause, targetPkColumn);
+        // 일반적인 날짜 컬럼명 패턴
+        String[] dateColumnPatterns = {
+            "created_at", "create_at", "created_date", "create_date", "reg_dt", "reg_date",
+            "updated_at", "update_at", "updated_date", "update_date", "upd_dt", "mod_date"
+        };
 
-        try (PreparedStatement updateStmt = conn.prepareStatement(updateSql)) {
-            int idx = 1;
-            for (String sourceCol : nonPkColumns.keySet()) {
-                Object value = sourceRow.get(sourceCol);
-                updateStmt.setObject(idx++, value);
+        try (Connection sourceConn = sourceDataSource.getConnection()) {
+            DatabaseMetaData metaData = sourceConn.getMetaData();
+            try (ResultSet columns = metaData.getColumns(null, null, sourceTable, null)) {
+                while (columns.next()) {
+                    String columnName = columns.getString("COLUMN_NAME").toLowerCase();
+
+                    // 이미 매핑된 컬럼은 건너뜀
+                    if (existingMappedSourceCols.stream().anyMatch(c -> c.equalsIgnoreCase(columnName))) {
+                        continue;
+                    }
+
+                    // 날짜 컬럼 패턴 매칭
+                    for (String pattern : dateColumnPatterns) {
+                        if (columnName.equals(pattern)) {
+                            // Target에 대응하는 컬럼 찾기
+                            String targetCol = detectTargetDateColumn(targetDataSource, targetTable, columnName);
+                            if (targetCol != null) {
+                                dateColumnMappings.put(columnName, targetCol);
+                                log.info("날짜 컬럼 자동 매핑: {}.{} -> {}.{}",
+                                        sourceTable, columnName, targetTable, targetCol);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
-            // WHERE 조건의 PK 값
-            updateStmt.setObject(idx, sourceRow.get(sourcePkColumn));
-            updateStmt.executeUpdate();
+        } catch (SQLException e) {
+            log.debug("날짜 컬럼 자동 감지 실패 (무시): {}", e.getMessage());
         }
+
+        return dateColumnMappings;
     }
 }
